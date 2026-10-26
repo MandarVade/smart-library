@@ -1,0 +1,1185 @@
+
+import { useCallback, useEffect, useState } from "react";
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  AreaChart,
+  Area,
+  CartesianGrid,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+} from "recharts";
+import "./App.css";
+
+const CHANNEL_ID = "3551621";
+const READ_API_KEY = "KMNQMSD48WU1Z1JD";
+const CAPACITY = 100;
+const COLORS = ["#4169e1", "#16a6a1", "#f2a541", "#8b5cf6"];
+
+const demoData = {
+  occupancy: 25,
+  entries: 80,
+  issued: 12,
+  returned: 7,
+  years: [15, 20, 25, 20],
+};
+
+const yearNames = ["First Year", "Second Year", "Third Year", "Fourth Year"];
+
+function Panel({ title, subtitle, children, badge }) {
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <div>
+          <h3>{title}</h3>
+          <p>{subtitle}</p>
+        </div>
+        {badge && <span className="tag muted-tag">{badge}</span>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function StatCard({ title, value, detail }) {
+  return (
+    <div className="stat-card">
+      <div className="stat-top">{title}</div>
+      <div className="stat-value">{value}</div>
+      <div className="stat-detail">{detail}</div>
+    </div>
+  );
+}
+
+function ChartFrame({ children }) {
+  return (
+    <div style={{ width: "100%", height: 250, minWidth: 0 }}>
+      <ResponsiveContainer width="100%" height="100%">
+        {children}
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+function App() {
+  const [occupancyData, setOccupancyData] = useState({
+    currentOccupancy: 0,
+    students: [],
+  });
+  const [studentAnalytics, setStudentAnalytics] = useState([]);
+  const [bookAnalytics, setBookAnalytics] = useState([]);
+  const [hourlyAnalytics, setHourlyAnalytics] = useState([]);
+  const [dailyAnalytics, setDailyAnalytics] = useState([]);
+  const [view, setView] = useState("dashboard");
+  const [data, setData] = useState(demoData);
+  const [history, setHistory] = useState([]);
+  const [cloudStatus, setCloudStatus] = useState("Connecting");
+  const [historyStatus, setHistoryStatus] = useState("Loading history");
+  const [loading, setLoading] = useState(false);
+  const [period, setPeriod] = useState("all");
+  const [students, setStudents] = useState([]);
+  const [books, setBooks] = useState([]);
+  const [events, setEvents] = useState([]);
+  const [overdue, setOverdue] = useState([]);
+  const [apiStatus, setApiStatus] = useState("Connecting");
+  const [operation, setOperation] = useState("entry");
+  const [selectedStudent, setSelectedStudent] = useState("STU001");
+  const [selectedBook, setSelectedBook] = useState("");
+  const [operationMessage, setOperationMessage] = useState("");
+  const [operationError, setOperationError] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [analytics, setAnalytics] = useState({
+    entries: 0,
+    exits: 0,
+    issues: 0,
+    returns: 0,
+    byYear: [],
+  });
+  const fetchLibraryData = useCallback(async () => {
+    try {
+      const endpoints = [
+        "/api/students",
+        "/api/books",
+        "/api/events?limit=10",
+        "/api/overdue",
+        "/api/analytics/summary",
+        "/api/analytics/daily",
+        "/api/analytics/hourly",
+        "/api/analytics/students",
+        "/api/analytics/books",
+        "/api/analytics/occupancy",
+      ];
+
+      const responses = await Promise.all(
+        endpoints.map((endpoint) =>
+          fetch(`http://localhost:3001${endpoint}`)
+        )
+      );
+
+      if (responses.some((response) => !response.ok)) {
+        throw new Error("Library API request failed");
+      }
+
+      const [
+        studentData,
+        bookData,
+        eventData,
+        overdueData,
+        analyticsData,
+        dailyData,
+        hourlyData,
+        studentAnalyticsData,
+        bookAnalyticsData,
+        occupancyResponse,
+      ] = await Promise.all(responses.map((response) => response.json()));
+
+      setStudents(studentData);
+      setBooks(bookData);
+      setEvents(eventData);
+      setOverdue(overdueData);
+      setAnalytics(analyticsData);
+      setDailyAnalytics(dailyData);
+      setHourlyAnalytics(hourlyData);
+      setStudentAnalytics(studentAnalyticsData);
+      setBookAnalytics(bookAnalyticsData);
+      setOccupancyData(occupancyResponse);
+      setApiStatus("Connected");
+    } catch (error) {
+      setApiStatus("Unavailable");
+      console.error("Library API error:", error);
+    }
+  }, []);
+  const submitOperation = async (event) => {
+    event.preventDefault();
+    setOperationMessage("");
+    setSubmitting(true);
+
+    try {
+      const response = await fetch(
+        `http://localhost:3001/api/operations/${operation}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            student_id: selectedStudent,
+            ...(operation === "issue" || operation === "return"
+              ? { book_id: selectedBook }
+              : {}),
+          }),
+        }
+      );
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.error || "Operation failed.");
+      }
+
+      setOperationError(false);
+      setOperationMessage(result.message);
+
+      await Promise.all([
+        fetchLibraryData(),
+        fetchLatest(),
+        fetchHistory(),
+      ]);
+    } catch (error) {
+      setOperationError(true);
+      setOperationMessage(error.message || "Unable to contact the library API.");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+  const requestUrl = useCallback((path) => {
+    const params = new URLSearchParams();
+    if (READ_API_KEY.trim()) params.set("api_key", READ_API_KEY.trim());
+    const query = params.toString();
+    return `https://api.thingspeak.com/channels/${CHANNEL_ID}/${path}${query ? `?${query}` : ""}`;
+  }, []);
+
+  const fetchLatest = useCallback(async () => {
+    try {
+      const response = await fetch(requestUrl("feeds/last.json"));
+      if (!response.ok) throw new Error("Unable to read latest data");
+      const feed = await response.json();
+
+      if (!feed.created_at || feed.field1 == null) {
+        throw new Error("No channel data");
+      }
+
+      const number = (value, fallback = 0) => {
+        const parsed = Number(value);
+        return value !== null && value !== "" && Number.isFinite(parsed)
+          ? parsed
+          : fallback;
+      };
+
+      setData({
+        occupancy: number(feed.field1, demoData.occupancy),
+        entries: number(feed.field2, demoData.entries),
+        issued: number(feed.field3, demoData.issued),
+        returned: number(feed.field4, demoData.returned),
+        years: [
+          number(feed.field5, demoData.years[0]),
+          number(feed.field6, demoData.years[1]),
+          number(feed.field7, demoData.years[2]),
+          number(feed.field8, demoData.years[3]),
+        ],
+      });
+      setCloudStatus("Connected");
+    } catch {
+      setCloudStatus("Demo mode");
+    }
+  }, [requestUrl]);
+
+  const fetchHistory = useCallback(async () => {
+    try {
+      const response = await fetch(requestUrl("feeds.json"));
+      if (!response.ok) throw new Error("History request failed");
+
+      const result = await response.json();
+      const feeds = (result.feeds || [])
+        .filter((feed) => feed.created_at && feed.field1 !== null)
+        .map((feed) => ({
+          timestamp: new Date(feed.created_at),
+          occupancy: Number(feed.field1) || 0,
+          entries: Number(feed.field2) || 0,
+          issued: Number(feed.field3) || 0,
+          returned: Number(feed.field4) || 0,
+          first: Number(feed.field5) || 0,
+          second: Number(feed.field6) || 0,
+          third: Number(feed.field7) || 0,
+          fourth: Number(feed.field8) || 0,
+        }))
+        .filter((feed) => !Number.isNaN(feed.timestamp.getTime()))
+        .sort((a, b) => a.timestamp - b.timestamp);
+
+      setHistory(feeds);
+      setHistoryStatus(`${feeds.length} records loaded`);
+    } catch {
+      setHistoryStatus("History unavailable");
+    }
+  }, [requestUrl]);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+
+    try {
+      await Promise.all([
+        fetchLatest(),
+        fetchHistory(),
+        fetchLibraryData(),
+      ]);
+    } finally {
+      setLoading(false);
+    }
+  }, [fetchLatest, fetchHistory, fetchLibraryData]);
+
+  useEffect(() => {
+    refresh();
+    const timer = setInterval(refresh, 30000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+
+  const filteredHistory = history.filter((item) => {
+    if (period === "all") return true;
+    const days = Number(period);
+    return Date.now() - item.timestamp.getTime() <= days * 86400000;
+  });
+
+  const average = (values) =>
+    values.length
+      ? values.reduce((sum, value) => sum + value, 0) / values.length
+      : 0;
+
+  const maxOccupancy = filteredHistory.length
+    ? Math.max(...filteredHistory.map((item) => item.occupancy))
+    : data.occupancy;
+
+  const averageOccupancy = Math.round(
+    average(filteredHistory.map((item) => item.occupancy))
+  );
+
+  const occupancySeries = filteredHistory.map((item) => ({
+    label: item.timestamp.toLocaleString([], {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    }),
+    occupancy: item.occupancy,
+    entries: item.entries,
+  }));
+
+  const hourlyMap = {};
+  const dailyMap = {};
+  const weekdayMap = {};
+  const heatmapMap = {};
+
+  filteredHistory.forEach((item) => {
+    const date = item.timestamp;
+    const hour = date.getHours();
+    const day = date.toLocaleDateString([], {
+      month: "short",
+      day: "numeric",
+    });
+    const weekday = date.toLocaleDateString([], { weekday: "short" });
+
+    if (!hourlyMap[hour]) {
+      hourlyMap[hour] = { hour, label: `${hour}:00`, total: 0, count: 0 };
+    }
+    hourlyMap[hour].total += item.occupancy;
+    hourlyMap[hour].count += 1;
+
+    if (!dailyMap[day]) {
+      dailyMap[day] = {
+        label: day,
+        entries: item.entries,
+        occupancyTotal: 0,
+        count: 0,
+        issued: item.issued,
+        returned: item.returned,
+      };
+    }
+
+    dailyMap[day].occupancyTotal += item.occupancy;
+    dailyMap[day].count += 1;
+    dailyMap[day].entries = Math.max(dailyMap[day].entries, item.entries);
+    dailyMap[day].issued = Math.max(dailyMap[day].issued, item.issued);
+    dailyMap[day].returned = Math.max(dailyMap[day].returned, item.returned);
+
+    if (!weekdayMap[weekday]) {
+      weekdayMap[weekday] = { label: weekday, total: 0, count: 0 };
+    }
+    weekdayMap[weekday].total += item.occupancy;
+    weekdayMap[weekday].count += 1;
+
+    const heatKey = `${date.getDay()}-${hour}`;
+    if (!heatmapMap[heatKey]) {
+      heatmapMap[heatKey] = {
+        day: date.getDay(),
+        hour,
+        total: 0,
+        count: 0,
+      };
+    }
+    heatmapMap[heatKey].total += item.occupancy;
+    heatmapMap[heatKey].count += 1;
+  });
+
+  const thingSpeakHourlyData = Object.values(hourlyMap)
+    .map((item) => ({
+      label: item.label,
+      average: Math.round(item.total / item.count),
+      readings: item.count,
+    }))
+    .sort((a, b) => Number(a.label.split(":")[0]) - Number(b.label.split(":")[0]));
+
+  const transactionDailyData = dailyAnalytics.map((item) => ({
+    label: item.day,
+    entries: item.entries,
+    exits: item.exits,
+    issued: item.issues,
+    returned: item.returns,
+  }));
+
+  const weekdayData = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    .map((day) => weekdayMap[day])
+    .filter(Boolean)
+    .map((item) => ({
+      label: item.label,
+      averageOccupancy: Math.round(item.total / item.count),
+    }));
+
+  const heatmapData = Object.values(heatmapMap).map((item) => ({
+    day: ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][item.day],
+    hour: `${item.hour}:00`,
+    value: Math.round(item.total / item.count),
+  }));
+
+  const years = yearNames.map((label, index) => ({
+    name: label,
+    visits:
+      analytics.byYear.find(
+        (item) => item.academic_year === index + 1
+      )?.visits ?? 0,
+  }));
+  const totalYearVisits = analytics.byYear.reduce(
+    (sum, item) => sum + item.visits,
+    0
+  );
+  const totalTransactions = data.issued + data.returned;
+  const busiestHour = [...thingSpeakHourlyData].sort(
+    (a, b) => b.average - a.average
+  )[0];
+
+  const styles = {
+    heatCell: (value) => ({
+      background: `rgba(65, 105, 225, ${Math.max(
+        0.08,
+        Math.min(value / Math.max(maxOccupancy, 1), 1)
+      )})`,
+      color: value / Math.max(maxOccupancy, 1) > 0.55 ? "#fff" : "#25324a",
+    }),
+  };
+
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-logo">SL</div>
+          <div>
+            <strong>Smart Library</strong>
+            <span>IoE Management System</span>
+          </div>
+        </div>
+
+        <div className="side-label">WORKSPACE</div>
+        <button
+          className={`nav-item ${view === "dashboard" ? "active" : ""}`}
+          onClick={() => setView("dashboard")}
+        >
+          ▦ Dashboard
+        </button>
+
+        <button
+          className={`nav-item ${view === "student" ? "active" : ""}`}
+          onClick={() => setView("student")}
+        >
+          ♙ Student Portal
+        </button>
+
+        <button
+          className={`nav-item ${view === "analytics" ? "active" : ""}`}
+          onClick={() => setView("analytics")}
+        >
+          ▤ Analytics & Reports
+        </button>
+
+        <div className="sidebar-bottom">
+          <div className="cloud-card">
+            <div className="cloud-title">
+              <span className="status-dot" />
+              ThingSpeak Cloud
+            </div>
+            <strong>{cloudStatus}</strong>
+            <p>{historyStatus}</p>
+            <button className="refresh-button" onClick={refresh}>
+              Refresh data
+            </button>
+          </div>
+          <div className="profile">
+            <div className="avatar">SL</div>
+            <div>
+              <strong>Library System</strong>
+              <span>Project dashboard</span>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <main className="main-content">
+        <header className="topbar">
+          <div>
+            <div className="breadcrumb">Workspace / Dashboard</div>
+            <h1>Library Overview</h1>
+            <p className="subtitle">
+              Library occupancy, borrowing activity and historical analytics.
+            </p>
+          </div>
+          <div className="top-actions">
+            <span className="cloud-badge">
+              <span className="status-dot" />
+              {cloudStatus}
+            </span>
+            <button className="primary-button" onClick={refresh} disabled={loading}>
+              {loading ? "Loading..." : "Sync data"}
+            </button>
+          </div>
+        </header>
+
+        <div className="view-switch">
+          <button
+            className={view === "admin" ? "switch-active" : ""}
+            onClick={() => setView("admin")}
+          >
+            Admin Dashboard
+          </button>
+          <button
+            className={view === "student" ? "switch-active" : ""}
+            onClick={() => setView("student")}
+          >
+            Student Dashboard
+          </button>
+        </div>
+
+        <section className="welcome-row">
+          <div>
+            <h2>{view === "admin" ? "Library analytics" : "Library status"}</h2>
+            <p>
+              {view === "admin"
+                ? "Visual reports for library management."
+                : "Check current occupancy before visiting."}
+            </p>
+          </div>
+          <select
+            className="period-select"
+            value={period}
+            onChange={(event) => setPeriod(event.target.value)}
+          >
+            <option value="all">All available history</option>
+            <option value="1">Last 24 hours</option>
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+          </select>
+        </section>
+
+        <section className="stats-grid">
+          <StatCard
+            title="Current occupancy"
+            value={data.occupancy}
+            detail={`${Math.round((data.occupancy / CAPACITY) * 100)}% of assumed capacity`}
+          />
+          <StatCard
+            title="Entries counter"
+            value={data.entries}
+            detail="Latest reported counter"
+          />
+          <StatCard
+            title="Books issued"
+            value={data.issued}
+            detail="Latest reported counter"
+          />
+          <StatCard
+            title="Books returned"
+            value={data.returned}
+            detail="Latest reported counter"
+          />
+        </section>
+
+        <section className="stats-grid">
+          <StatCard
+            title="Average recorded occupancy"
+            value={averageOccupancy}
+            detail={`${filteredHistory.length} readings in selected period`}
+          />
+          <StatCard
+            title="Maximum recorded occupancy"
+            value={maxOccupancy}
+            detail="Highest stored reading"
+          />
+          <StatCard
+            title="Year-wise visits"
+            value={totalYearVisits}
+            detail="Sum of latest year counters"
+          />
+          <StatCard
+            title="Peak recorded hour"
+            value={busiestHour?.label ?? "Not available"}
+            detail={
+              busiestHour
+                ? `Average occupancy ${busiestHour.average}`
+                : "Collect more history"
+            }
+          />
+        </section>
+
+        <section className="charts-grid">
+          <Panel
+            title="Occupancy over time"
+            subtitle="Recorded occupancy at each ThingSpeak update"
+            badge={historyStatus}
+          >
+            <ChartFrame>
+              <AreaChart data={occupancySeries}>
+                <defs>
+                  <linearGradient id="occupancyGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#4169e1" stopOpacity={0.3} />
+                    <stop offset="95%" stopColor="#4169e1" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                <XAxis dataKey="label" hide={occupancySeries.length > 12} />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Area
+                  type="monotone"
+                  dataKey="occupancy"
+                  stroke="#4169e1"
+                  fill="url(#occupancyGradient)"
+                />
+              </AreaChart>
+            </ChartFrame>
+          </Panel>
+
+          <Panel
+            title="Hourly average occupancy"
+            subtitle="Average recorded occupancy by local hour"
+          >
+            <ChartFrame>
+              <BarChart data={thingSpeakHourlyData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                <XAxis dataKey="label" />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Bar dataKey="average" name="Average occupancy" fill="#16a6a1" radius={[5, 5, 0, 0]} />
+              </BarChart>
+            </ChartFrame>
+          </Panel>
+
+          <Panel
+            title="Hourly Student Entries"
+            subtitle="Actual entry events recorded in SQLite"
+          >
+            <ChartFrame>
+              <BarChart
+                data={hourlyAnalytics.map((item) => ({
+                  hour: `${item.hour}:00`,
+                  entries: item.entries,
+                }))}
+              >
+                <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                <XAxis dataKey="hour" />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Bar
+                  dataKey="entries"
+                  name="Student entries"
+                  fill="#4169e1"
+                  radius={[5, 5, 0, 0]}
+                />
+              </BarChart>
+            </ChartFrame>
+          </Panel>
+
+          <Panel
+            title="Year-wise visit distribution"
+            subtitle="Latest aggregate counters by year"
+          >
+            <ChartFrame>
+              <PieChart>
+                <Pie
+                  data={years}
+                  dataKey="visits"
+                  nameKey="name"
+                  cx="50%"
+                  cy="50%"
+                  outerRadius={85}
+                  label={({ name, percent }) =>
+                    `${name.replace(" Year", "")} ${(percent * 100).toFixed(0)}%`
+                  }
+                >
+                  {years.map((item, index) => (
+                    <Cell key={item.name} fill={COLORS[index % COLORS.length]} />
+                  ))}
+                </Pie>
+                <Tooltip />
+              </PieChart>
+            </ChartFrame>
+          </Panel>
+
+          <Panel
+            title="Books issued versus returned"
+            subtitle="Current channel counters"
+          >
+            <ChartFrame>
+              <BarChart data={[
+                { name: "Issued", count: analytics.issues },
+                { name: "Returned", count: analytics.returns },
+              ]}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                <XAxis dataKey="name" />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Bar dataKey="count" name="Books" fill="#4169e1" radius={[5, 5, 0, 0]} />
+              </BarChart>
+            </ChartFrame>
+            <p className="note">
+              These are current counters, not individual book transaction records.
+            </p>
+          </Panel>
+
+          <Panel
+            title="Daily usage trends"
+            subtitle="Recorded entry counters and average occupancy"
+          >
+            <ChartFrame>
+              <LineChart data={transactionDailyData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                <XAxis dataKey="label" />
+                <YAxis />
+                <Tooltip />
+                <Legend />
+                <Line type="monotone" dataKey="entries" stroke="#4169e1" name="Entry counter" />
+                <Line
+                  type="monotone"
+                  dataKey="entries"
+                  stroke="#4169e1"
+                  name="Entries"
+                />
+                <Line
+                  type="monotone"
+                  dataKey="exits"
+                  stroke="#8b5cf6"
+                  name="Exits"
+                />
+              </LineChart>
+            </ChartFrame>
+          </Panel>
+
+          <Panel
+            title="Weekly occupancy pattern"
+            subtitle="Average readings by weekday"
+          >
+            <ChartFrame>
+              <BarChart data={weekdayData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                <XAxis dataKey="label" />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Bar dataKey="averageOccupancy" name="Average occupancy" fill="#8b5cf6" radius={[5, 5, 0, 0]} />
+              </BarChart>
+            </ChartFrame>
+          </Panel>
+
+          <Panel
+            title="Daily book circulation"
+            subtitle="Maximum counters observed per day"
+          >
+            <ChartFrame>
+              <AreaChart data={transactionDailyData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                <XAxis dataKey="label" />
+                <YAxis allowDecimals={false} />
+                <Tooltip />
+                <Legend />
+                <Area type="monotone" dataKey="issued" name="Issued counter" stroke="#4169e1" fill="#4169e133" />
+                <Area type="monotone" dataKey="returned" name="Returned counter" stroke="#16a6a1" fill="#16a6a133" />
+              </AreaChart>
+            </ChartFrame>
+          </Panel>
+
+          <Panel
+            title="Occupancy heatmap"
+            subtitle="Weekday and hour patterns from collected readings"
+            badge="Historical"
+          >
+            {heatmapData.length ? (
+              <div className="heatmap">
+                <div className="heatmap-row heatmap-header">
+                  <span>Day</span>
+                  <span>Hour</span>
+                  <span>Average occupancy</span>
+                </div>
+                {heatmapData
+                  .sort((a, b) => a.day.localeCompare(b.day) || a.hour.localeCompare(b.hour))
+                  .map((item, index) => (
+                    <div className="heatmap-row" key={`${item.day}-${item.hour}-${index}`}>
+                      <span>{item.day}</span>
+                      <span>{item.hour}</span>
+                      <strong style={styles.heatCell(item.value)}>
+                        {item.value}
+                      </strong>
+                    </div>
+                  ))}
+              </div>
+            ) : (
+              <p className="note">
+                No historical readings available for this period.
+              </p>
+            )}
+          </Panel>
+        </section>
+
+        <section className="library-data-section">
+          <div className="section-heading">
+            <h2>Library Analytics</h2>
+            <p>Student activity and book popularity from SQLite records</p>
+          </div>
+          <div className="stats-grid">
+            <StatCard
+              title="Students Currently Inside"
+              value={occupancyData.currentOccupancy}
+            />
+          </div>
+
+          <Panel
+            title="Students Currently Inside"
+            subtitle="Based on each student's latest entry or exit event"
+          >
+            {occupancyData.students.length > 0 ? (
+              <div className="library-tables-grid">
+                {occupancyData.students.map((student) => (
+                  <div className="library-table" key={student.student_id}>
+                    <strong>{student.name}</strong>
+                    <p>{student.student_id}</p>
+                    <p>Year {student.academic_year}</p>
+                    <p>
+                      Last entry:{" "}
+                      {new Date(student.entry_time).toLocaleString("en-IN", {
+                        timeZone: "Asia/Kolkata",
+                      })}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="note">No students are currently recorded inside.</p>
+            )}
+          </Panel>
+
+          <div className="charts-grid">
+            <Panel
+              title="Student Activity"
+              subtitle="Entries, books issued, and books returned per student"
+            >
+              <ChartFrame>
+                <BarChart
+                  data={studentAnalytics}
+                  margin={{ bottom: 45 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                  <XAxis
+                    dataKey="name"
+                    angle={-25}
+                    textAnchor="end"
+                    interval={0}
+                  />
+                  <YAxis allowDecimals={false} />
+                  <Tooltip />
+                  <Legend />
+                  <Bar dataKey="entries" name="Entries" fill="#4169e1" />
+                  <Bar dataKey="books_issued" name="Books issued" fill="#8b5cf6" />
+                  <Bar dataKey="books_returned" name="Books returned" fill="#16a6a1" />
+                </BarChart>
+              </ChartFrame>
+            </Panel>
+
+            <Panel
+              title="Most Borrowed Books"
+              subtitle="Total recorded book issues, ranked by popularity"
+            >
+              <ChartFrame>
+                <BarChart
+                  data={[...bookAnalytics].sort(
+                    (a, b) => b.total_issues - a.total_issues
+                  )}
+                  layout="vertical"
+                  margin={{ left: 25 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#edf0f6" />
+                  <XAxis type="number" allowDecimals={false} />
+                  <YAxis
+                    type="category"
+                    dataKey="title"
+                    width={160}
+                    tick={{ fontSize: 11 }}
+                  />
+                  <Tooltip />
+                  <Bar
+                    dataKey="total_issues"
+                    name="Total issues"
+                    fill="#4169e1"
+                    radius={[0, 5, 5, 0]}
+                  />
+                </BarChart>
+              </ChartFrame>
+            </Panel>
+          </div>
+        </section>
+
+        <section className="library-data-section">
+          <div className="section-heading">
+            <h2>Library Operations</h2>
+            <p>Live records from the SQLite database</p>
+            <span className={`api-status ${apiStatus === "Connected" ? "api-online" : ""}`}>
+              Library API: {apiStatus}
+            </span>
+          </div>
+
+          <div className="stats-grid">
+            <StatCard
+              title="Registered Students"
+              value={students.length}
+              detail="Student database"
+            />
+            <StatCard
+              title="Total Books"
+              value={books.length}
+              detail="Registered library books"
+            />
+            <StatCard
+              title="Available Books"
+              value={books.filter((book) => book.available === 1).length}
+              detail="Ready to issue"
+            />
+            <StatCard
+              title="Overdue Books"
+              value={overdue.length}
+              detail="Require attention"
+            />
+          </div>
+
+          <Panel
+            title="Record Library Operation"
+            subtitle="Record student visits and book circulation"
+          >
+            <form className="operation-form" onSubmit={submitOperation}>
+              <label>
+                Operation
+                <select
+                  value={operation}
+                  onChange={(event) => {
+                    setOperation(event.target.value);
+                    setOperationMessage("");
+                  }}
+                >
+                  <option value="entry">Student Entry</option>
+                  <option value="exit">Student Exit</option>
+                  <option value="issue">Issue Book</option>
+                  <option value="return">Return Book</option>
+                </select>
+              </label>
+
+              <label>
+                Student
+                <select
+                  value={selectedStudent}
+                  onChange={(event) => setSelectedStudent(event.target.value)}
+                  required
+                >
+                  {students.map((student) => (
+                    <option key={student.student_id} value={student.student_id}>
+                      {student.student_id} — {student.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              {(operation === "issue" || operation === "return") && (
+                <label>
+                  Book
+                  <select
+                    value={selectedBook}
+                    onChange={(event) => setSelectedBook(event.target.value)}
+                    required
+                  >
+                    <option value="">Select a book</option>
+                    {books
+                      .filter((book) =>
+                        operation === "issue"
+                          ? book.available === 1
+                          : book.available === 0
+                      )
+                      .map((book) => (
+                        <option key={book.book_id} value={book.book_id}>
+                          {book.book_id} — {book.title}
+                        </option>
+                      ))}
+                  </select>
+                </label>
+              )}
+
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={submitting || !students.length ||
+                  ((operation === "issue" || operation === "return") && !selectedBook)}
+              >
+                {submitting ? "Recording..." : "Record Operation"}
+              </button>
+
+              {operationMessage && (
+                <p
+                  className={`operation-message ${operationError ? "operation-error" : "operation-success"
+                    }`}
+                  role="status"
+                >
+                  {operationMessage}
+                </p>
+              )}
+            </form>
+          </Panel>
+
+          <div className="library-tables-grid">
+            <Panel title="Student Records" subtitle="Registered students">
+              <div className="table-scroll">
+                <table className="library-table">
+                  <thead>
+                    <tr>
+                      <th>Student ID</th>
+                      <th>Name</th>
+                      <th>Year</th>
+                      <th>Branch</th>
+                      <th>Roll No.</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {students.map((student) => (
+                      <tr key={student.student_id}>
+                        <td>{student.student_id}</td>
+                        <td>{student.name}</td>
+                        <td>{student.academic_year}</td>
+                        <td>{student.branch}</td>
+                        <td>{student.roll_number}</td>
+                      </tr>
+                    ))}
+                    {!students.length && (
+                      <tr><td colSpan="5">No student records available.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </Panel>
+
+            <Panel title="Book Inventory" subtitle="Current availability">
+              <div className="table-scroll">
+                <table className="library-table">
+                  <thead>
+                    <tr>
+                      <th>Book ID</th>
+                      <th>Title</th>
+                      <th>Author</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {books.map((book) => (
+                      <tr key={book.book_id}>
+                        <td>{book.book_id}</td>
+                        <td>{book.title}</td>
+                        <td>{book.author}</td>
+                        <td>
+                          <span className={`book-status ${book.available === 1 ? "book-available" : "book-issued"}`}>
+                            {book.available === 1 ? "Available" : "Issued"}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                    {!books.length && (
+                      <tr><td colSpan="4">No books available.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </Panel>
+
+            <Panel title="Recent Transactions" subtitle="Latest library events">
+              <div className="table-scroll">
+                <table className="library-table">
+                  <thead>
+                    <tr>
+                      <th>Time</th>
+                      <th>Student</th>
+                      <th>Event</th>
+                      <th>Book</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {events.map((event) => (
+                      <tr key={event.id}>
+                        <td>{new Date(event.timestamp).toLocaleString()}</td>
+                        <td>{event.student_name || event.student_id}</td>
+                        <td>
+                          <span className="event-label">{event.event_type}</span>
+                        </td>
+                        <td>{event.book_title || "—"}</td>
+                      </tr>
+                    ))}
+                    {!events.length && (
+                      <tr><td colSpan="4">No transactions available.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </Panel>
+
+            <Panel title="Overdue Books" subtitle="Books past their due date">
+              <div className="table-scroll">
+                <table className="library-table">
+                  <thead>
+                    <tr>
+                      <th>Student</th>
+                      <th>Book</th>
+                      <th>Due Date</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {overdue.map((item, index) => (
+                      <tr key={`${item.student_id}-${item.book_id}-${index}`}>
+                        <td>{item.student_name || item.student_id}</td>
+                        <td>{item.book_title || item.book_id}</td>
+                        <td>{item.due_date}</td>
+                      </tr>
+                    ))}
+                    {!overdue.length && (
+                      <tr><td colSpan="3">No overdue books.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </Panel>
+          </div>
+        </section>
+
+        <section className="panel conclusion-panel">
+          <div className="panel-heading">
+            <div>
+              <h3>Analytics notes</h3>
+              <p>Interpretation of available records</p>
+            </div>
+          </div>
+          <div className="insight-list">
+            <div>
+              <span className="insight-number">01</span>
+              <div>
+                <strong>Occupancy</strong>
+                <p>
+                  Average occupancy is {averageOccupancy}, with a maximum
+                  recorded value of {maxOccupancy} in the selected period.
+                </p>
+              </div>
+            </div>
+            <div>
+              <span className="insight-number">02</span>
+              <div>
+                <strong>Peak hour</strong>
+                <p>
+                  {busiestHour
+                    ? `${busiestHour.label} has the highest average among the hours represented in the current records.`
+                    : "Collect readings across multiple hours to identify peak periods."}
+                </p>
+              </div>
+            </div>
+            <div>
+              <span className="insight-number">03</span>
+              <div>
+                <strong>Data quality</strong>
+                <p>
+                  Daily and weekly charts are preliminary until the simulator
+                  maintains date-aware counters and records genuine entry/exit
+                  events.
+                </p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <footer className="footer">
+          <span>Smart Library Management System</span>
+          <span>RFID · ESP8266 · ThingSpeak · React</span>
+        </footer>
+      </main>
+    </div>
+  );
+}
+
+export default App;

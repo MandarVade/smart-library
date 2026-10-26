@@ -1,0 +1,206 @@
+
+import sqlite3
+from datetime import date, timedelta
+
+from database import get_connection, initialize_database
+
+
+def seed_demo_data():
+    students = [
+        ("STU001", "Aarav Patil", 1, "IT", "101"),
+        ("STU002", "Priya Shah", 2, "IT", "205"),
+        ("STU003", "Rohan Deshmukh", 3, "CS", "307"),
+        ("STU004", "Neha Kulkarni", 4, "IT", "412"),
+    ]
+
+    books = [
+        ("BK001", "Computer Networks", "Tanenbaum"),
+        ("BK002", "Database System Concepts", "Silberschatz"),
+        ("BK003", "Operating System Concepts", "Silberschatz"),
+        ("BK004", "Python Programming", "Guido van Rossum"),
+        ("BK005", "Machine Learning", "Tom Mitchell"),
+    ]
+
+    with get_connection() as connection:
+        connection.executemany("""
+            INSERT OR IGNORE INTO students
+            (student_id, name, academic_year, branch, roll_number)
+            VALUES (?, ?, ?, ?, ?)
+        """, students)
+
+        connection.executemany("""
+            INSERT OR IGNORE INTO books (book_id, title, author)
+            VALUES (?, ?, ?)
+        """, books)
+
+    print("Demo students and books ready.")
+
+
+def record_event(event_type, student_id, book_id=None):
+    if event_type not in {"entry", "exit", "issue", "return"}:
+        raise ValueError("Invalid event type.")
+
+    with get_connection() as connection:
+        student = connection.execute(
+            "SELECT student_id FROM students WHERE student_id = ?",
+            (student_id,),
+        ).fetchone()
+
+        if not student:
+            raise ValueError(f"Unknown student: {student_id}")
+
+        if event_type in {"issue", "return"}:
+            if not book_id:
+                raise ValueError("A book ID is required.")
+
+            book = connection.execute(
+                "SELECT available FROM books WHERE book_id = ?",
+                (book_id,),
+            ).fetchone()
+
+            if not book:
+                raise ValueError(f"Unknown book: {book_id}")
+
+            if event_type == "issue":
+                if book["available"] == 0:
+                    raise ValueError("Book is already issued.")
+
+                due_date = (date.today() + timedelta(days=14)).isoformat()
+
+                connection.execute(
+                    "UPDATE books SET available = 0 WHERE book_id = ?",
+                    (book_id,),
+                )
+
+                connection.execute("""
+                    INSERT INTO events
+                    (student_id, book_id, event_type, due_date)
+                    VALUES (?, ?, 'issue', ?)
+                """, (student_id, book_id, due_date))
+
+            else:
+                active_loan = connection.execute("""
+                    SELECT id FROM events
+                    WHERE student_id = ?
+                      AND book_id = ?
+                      AND event_type = 'issue'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM events AS r
+                          WHERE r.book_id = events.book_id
+                            AND r.event_type = 'return'
+                            AND r.id > events.id
+                      )
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, (student_id, book_id)).fetchone()
+
+                if not active_loan:
+                    raise ValueError(
+                        "This student has no active loan for that book."
+                    )
+
+                connection.execute(
+                    "UPDATE books SET available = 1 WHERE book_id = ?",
+                    (book_id,),
+                )
+
+                connection.execute("""
+                    INSERT INTO events (student_id, book_id, event_type)
+                    VALUES (?, ?, 'return')
+                """, (student_id, book_id))
+
+        else:
+            last_event = connection.execute("""
+                SELECT event_type
+                FROM events
+                WHERE student_id = ?
+                  AND event_type IN ('entry', 'exit')
+                ORDER BY id DESC
+                LIMIT 1
+            """, (student_id,)).fetchone()
+
+            if event_type == "entry":
+                if last_event and last_event["event_type"] == "entry":
+                    raise ValueError("Student is already inside the library.")
+
+            elif event_type == "exit":
+                if not last_event or last_event["event_type"] != "entry":
+                    raise ValueError("Student is not currently inside the library.")
+
+            connection.execute("""
+                INSERT INTO events (student_id, event_type)
+                VALUES (?, ?)
+            """, (student_id, event_type))
+
+    print(f"Recorded: {event_type} | Student: {student_id}"
+          + (f" | Book: {book_id}" if book_id else ""))
+
+
+def show_summary():
+    with get_connection() as connection:
+        for table in ("students", "books", "events"):
+            count = connection.execute(
+                f"SELECT COUNT(*) FROM {table}"
+            ).fetchone()[0]
+            print(f"{table.capitalize()}: {count}")
+
+        print("\nRecent events:")
+        rows = connection.execute("""
+            SELECT e.id, s.name, e.event_type, b.title,
+                   e.timestamp, e.due_date
+            FROM events e
+            LEFT JOIN students s ON s.student_id = e.student_id
+            LEFT JOIN books b ON b.book_id = e.book_id
+            ORDER BY e.id DESC
+            LIMIT 10
+        """).fetchall()
+
+        for row in rows:
+            print(dict(row))
+
+
+
+if __name__ == "__main__":
+    initialize_database()
+    seed_demo_data()
+
+    # Record entry and exit events on every run.
+    record_event("entry", "STU001")
+    record_event("entry", "STU002")
+    record_event("exit", "STU001")
+
+    # Issue a book only if it is currently available.
+    with get_connection() as connection:
+        book = connection.execute(
+            "SELECT available FROM books WHERE book_id = ?",
+            ("BK001",),
+        ).fetchone()
+
+    if book and book["available"]:
+        record_event("issue", "STU001", "BK001")
+    else:
+        print("BK001 is already issued; skipping duplicate issue.")
+
+    # Return BK001 only if STU001 has an active loan.
+    with get_connection() as connection:
+        loan = connection.execute("""
+            SELECT id FROM events
+            WHERE student_id = ?
+              AND book_id = ?
+              AND event_type = 'issue'
+              AND NOT EXISTS (
+                  SELECT 1 FROM events AS r
+                  WHERE r.book_id = events.book_id
+                    AND r.event_type = 'return'
+                    AND r.id > events.id
+              )
+            ORDER BY id DESC
+            LIMIT 1
+        """, ("STU001", "BK001")).fetchone()
+
+    if loan:
+        record_event("return", "STU001", "BK001")
+
+    print()
+    show_summary()
+
