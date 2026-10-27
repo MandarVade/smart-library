@@ -60,6 +60,66 @@ app.get("/api/books", (req, res) => {
   }
 });
 
+
+app.get("/api/loans/status", (req, res) => {
+  const { student_id, book_id } = req.query;
+
+  if (typeof student_id !== "string" || !student_id.trim() ||
+      typeof book_id !== "string" || !book_id.trim()) {
+    return res.status(400).json({
+      error: "student_id and book_id are required."
+    });
+  }
+
+  try {
+    const students = queryDatabase(
+      "SELECT student_id FROM students WHERE student_id = ?",
+      [student_id.trim()]
+    );
+    if (!students.length) {
+      return res.status(404).json({ error: "Unknown student." });
+    }
+
+    const books = queryDatabase(
+      "SELECT book_id, available FROM books WHERE book_id = ?",
+      [book_id.trim()]
+    );
+    if (!books.length) {
+      return res.status(404).json({ error: "Unknown book." });
+    }
+
+    const loans = queryDatabase(`
+      SELECT student_id, due_date
+      FROM events e
+      WHERE book_id = ? AND event_type = 'issue'
+        AND NOT EXISTS (
+          SELECT 1 FROM events r
+          WHERE r.book_id = e.book_id
+            AND r.event_type = 'return'
+            AND r.id > e.id
+        )
+      ORDER BY id DESC
+      LIMIT 1
+    `, [book_id.trim()]);
+
+    const activeLoan = loans[0] || null;
+    return res.json({
+      student_id: student_id.trim(),
+      book_id: book_id.trim(),
+      available: books[0].available === 1,
+      issued_to_student: Boolean(
+        activeLoan && activeLoan.student_id === student_id.trim()
+      ),
+      issued_to_another_student: Boolean(
+        activeLoan && activeLoan.student_id !== student_id.trim()
+      ),
+      due_date: activeLoan ? activeLoan.due_date : null
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "Unable to check loan status." });
+  }
+});
+
 app.get("/api/events", (req, res) => {
   try {
     const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);

@@ -24,3 +24,7 @@ TODOs.md
 
 # runtime-created symlink for glob-import playground tests
 playground/glob-import/root/follow-symlinks/linked/my-lib
+
+# Local ESP8266 credentials
+firmware/config.h
+firmware/rfid_library/config.h

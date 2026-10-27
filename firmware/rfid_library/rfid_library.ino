@@ -1,0 +1,364 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClient.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <MFRC522.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ArduinoJson.h>
+#include "config.h"
+
+#define RFID_SS_PIN D4
+#define RFID_RST_PIN D3
+#define OLED_SDA_PIN D2
+#define OLED_SCL_PIN D1
+#define BUZZER_PIN D0
+
+#define OLED_WIDTH 128
+#define OLED_HEIGHT 64
+
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+
+String currentStudentId = "";
+String currentStudentName = "";
+unsigned long studentSelectedAt = 0;
+bool waitingForBook = false;
+bool oledAvailable = false;
+
+String normalizeUid(String uid) {
+  uid.toUpperCase();
+  uid.replace(" ", "");
+  uid.replace(":", "");
+  uid.replace("-", "");
+  return uid;
+}
+
+String readUid() {
+  String uid;
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+void showMessage(const String& line1, const String& line2 = "",
+                 const String& line3 = "") {
+  Serial.println(line1 + (line2.length() ? " | " + line2 : ""));
+  if (!oledAvailable) return;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println(line1);
+  if (line2.length()) {
+    display.println();
+    display.println(line2);
+  }
+  if (line3.length()) {
+    display.println();
+    display.println(line3);
+  }
+  display.display();
+}
+
+void beepSuccess() {
+  tone(BUZZER_PIN, 2200, 100);
+  delay(130);
+  noTone(BUZZER_PIN);
+}
+
+void beepError() {
+  for (int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, 900, 80);
+    delay(120);
+    noTone(BUZZER_PIN);
+    delay(70);
+  }
+}
+
+bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+
+  showMessage("Connecting Wi-Fi", WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long started = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - started < 15000) {
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("Wi-Fi connected. IP: ");
+    Serial.println(WiFi.localIP());
+    showMessage("Wi-Fi connected", WiFi.localIP().toString());
+    return true;
+  }
+
+  showMessage("Wi-Fi unavailable", "Check credentials");
+  return false;
+}
+
+bool apiGet(const String& path, String& response) {
+  if (!ensureWiFi()) return false;
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(5000);
+
+  if (!http.begin(client, String(API_BASE_URL) + path)) return false;
+
+  int status = http.GET();
+  response = http.getString();
+  http.end();
+
+  Serial.printf("GET %s -> %d\n", path.c_str(), status);
+  return status >= 200 && status < 300;
+}
+
+bool apiPost(const String& eventType, const String& studentId,
+             const String& bookId, String& message) {
+  if (!ensureWiFi()) {
+    message = "Wi-Fi unavailable";
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setTimeout(7000);
+
+  String url = String(API_BASE_URL) + "/api/operations/" + eventType;
+  if (!http.begin(client, url)) {
+    message = "HTTP setup failed";
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument payload;
+  payload["student_id"] = studentId;
+  if (bookId.length()) payload["book_id"] = bookId;
+
+  String body;
+  serializeJson(payload, body);
+
+  int status = http.POST(body);
+  String response = http.getString();
+  http.end();
+
+  JsonDocument result;
+  DeserializationError error = deserializeJson(result, response);
+
+  if (error) {
+    message = "Invalid API response";
+    Serial.println(response);
+    return false;
+  }
+
+  if (status >= 200 && status < 300 &&
+      result["success"].as<bool>()) {
+    message = result["message"] | "Operation successful";
+    return true;
+  }
+
+  message = result["error"] | "API request failed";
+  Serial.printf("POST %s -> %d: %s\n",
+                eventType.c_str(), status, message.c_str());
+  return false;
+}
+
+bool findMapping(const String& uid, const RfidMapping* mappings,
+                 size_t count, String& recordId) {
+  for (size_t i = 0; i < count; i++) {
+    if (uid == normalizeUid(String(mappings[i].uid))) {
+      recordId = mappings[i].recordId;
+      return true;
+    }
+  }
+  return false;
+}
+
+String getStudentName(const String& studentId) {
+  String response;
+  if (!apiGet("/api/students", response)) return studentId;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, response)) return studentId;
+
+  for (JsonObject student : doc.as<JsonArray>()) {
+    if (student["student_id"].as<String>() == studentId) {
+      return student["name"] | studentId;
+    }
+  }
+  return studentId;
+}
+
+bool getBookAvailability(const String& bookId, bool& available) {
+  String response;
+  if (!apiGet("/api/books", response)) return false;
+
+  JsonDocument doc;
+  if (deserializeJson(doc, response)) return false;
+
+  for (JsonObject book : doc.as<JsonArray>()) {
+    if (book["book_id"].as<String>() == bookId) {
+      available = book["available"].as<int>() == 1;
+      return true;
+    }
+  }
+  return false;
+}
+
+void processBook(const String& bookId) {
+  String response;
+  String query = "/api/loans/status?student_id=" +
+                 currentStudentId + "&book_id=" + bookId;
+
+  if (!apiGet(query, response)) {
+    showMessage("Cannot check loan", "Check API/network");
+    beepError();
+    waitingForBook = false;
+    currentStudentId = "";
+    currentStudentName = "";
+    return;
+  }
+
+  JsonDocument status;
+  if (deserializeJson(status, response)) {
+    showMessage("Invalid loan status", "Check API response");
+    beepError();
+    waitingForBook = false;
+    currentStudentId = "";
+    currentStudentName = "";
+    return;
+  }
+
+  bool available = status["available"] | false;
+  bool issuedToStudent = status["issued_to_student"] | false;
+  bool issuedToAnother = status["issued_to_another_student"] | false;
+
+  if (issuedToAnother) {
+    showMessage("Book not available", "Issued to another student");
+    beepError();
+  } else if (!available && !issuedToStudent) {
+    showMessage("Loan status conflict", "Ask library staff");
+    beepError();
+  } else {
+    String eventType = issuedToStudent ? "return" : "issue";
+    String message;
+
+    showMessage(issuedToStudent ? "Processing return" : "Processing issue",
+                bookId, currentStudentName);
+
+    bool success = apiPost(eventType, currentStudentId, bookId, message);
+
+    if (success) {
+      showMessage(issuedToStudent ? "Book returned" : "Book issued",
+                  currentStudentName, bookId);
+      beepSuccess();
+    } else {
+      showMessage("Operation rejected", message);
+      beepError();
+    }
+  }
+
+  waitingForBook = false;
+  currentStudentId = "";
+  currentStudentName = "";
+}
+
+void processCard() {
+  String uid = readUid();
+  Serial.println("Scanned UID: " + uid);
+
+  String recordId;
+
+  if (findMapping(uid, STUDENT_MAPPINGS,
+                  sizeof(STUDENT_MAPPINGS) / sizeof(STUDENT_MAPPINGS[0]),
+                  recordId)) {
+    currentStudentId = recordId;
+    currentStudentName = getStudentName(recordId);
+    studentSelectedAt = millis();
+    waitingForBook = true;
+
+    showMessage("Student identified", currentStudentName,
+                "Scan book within 15s");
+    beepSuccess();
+    return;
+  }
+
+  if (findMapping(uid, BOOK_MAPPINGS,
+                  sizeof(BOOK_MAPPINGS) / sizeof(BOOK_MAPPINGS[0]),
+                  recordId)) {
+    if (!waitingForBook) {
+      showMessage("Scan student card", "before scanning book");
+      beepError();
+      return;
+    }
+
+    if (millis() - studentSelectedAt > BOOK_SCAN_TIMEOUT_MS) {
+      waitingForBook = false;
+      currentStudentId = "";
+      currentStudentName = "";
+      showMessage("Scan timed out", "Scan student again");
+      beepError();
+      return;
+    }
+
+    processBook(recordId);
+    return;
+  }
+
+  showMessage("Unknown RFID tag", uid);
+  beepError();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  oledAvailable = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+
+  showMessage("Smart Library", "Starting firmware");
+
+  SPI.begin();
+  rfid.PCD_Init();
+  rfid.PCD_SetAntennaGain(rfid.RxGain_max);
+
+  ensureWiFi();
+  showMessage("Smart Library", "Scan student card");
+}
+
+void loop() {
+  if (waitingForBook &&
+      millis() - studentSelectedAt > BOOK_SCAN_TIMEOUT_MS) {
+    waitingForBook = false;
+    currentStudentId = "";
+    currentStudentName = "";
+    showMessage("Scan timed out", "Scan student again");
+  }
+
+  if (!rfid.PICC_IsNewCardPresent()) {
+    delay(30);
+    return;
+  }
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    delay(30);
+    return;
+  }
+
+  processCard();
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  delay(800);
+}
